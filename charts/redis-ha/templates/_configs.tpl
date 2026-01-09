@@ -402,6 +402,8 @@
 {{- end }}
 
 {{- define "trigger-failover-if-master.sh" }}
+    #!/bin/sh
+    set -e
     {{- if or (eq (int .Values.redis.port) 0) (eq (int .Values.sentinel.port) 0) }}
     TLS_CLIENT_OPTION="--tls --cacert /tls-certs/{{ .Values.tls.caCertFile }}{{ if ne (default "yes" .Values.sentinel.authClients) "no"}} --cert /tls-certs/{{ .Values.tls.certFile }} --key /tls-certs/{{ .Values.tls.keyFile }}{{end}}"
     {{- end }}
@@ -421,15 +423,23 @@
       )
     }
     get_redis_role
-    if [[ "$is_master" -eq 1 ]]; then
-      echo "This node is currently master, we trigger a failover."
-      {{- $masterGroupName := include "redis-ha.masterGroupName" . }}
+    if [[ "$is_master" -ne 1 ]]; then
+      echo "[INFO] This node is not master, nothing to do"
+      exit 0
+    fi
+
+    {{- $masterGroupName := include "redis-ha.masterGroupName" . }}
+    SERVICE={{ template "redis-ha.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
+
+    echo "[INFO] This node is currently master, we trigger a failover."
+    # Retry loop for Sentinel
+    for i in $(seq 1 10); do
       response=$(
         redis-cli \
         {{- if .Values.sentinel.auth }}
           -a "${SENTINELAUTH}" --no-auth-warning \
         {{- end }}
-          -h localhost \
+          -h "${SERVICE}" \
         {{- if (int .Values.sentinel.port) }}
           -p {{ .Values.sentinel.port }} \
         {{- else }}
@@ -437,18 +447,25 @@
         {{- end}}
           SENTINEL failover {{ $masterGroupName }}
       )
-      if [[ "$response" != "OK" ]] ; then
-        echo "$response"
-        exit 1
+      if [ "$response" = "OK" ]; then
+        echo "[INFO] Failover triggered"
+        break
       fi
-      timeout=30
-      while [[ "$is_master" -eq 1 && $timeout -gt 0 ]]; do
-        sleep 1
-        get_redis_role
-        timeout=$((timeout - 1))
-      done
-      echo "Failover successful"
-    fi
+      echo "[WARN] Retrying failover ($i/10)..."
+      sleep 1
+    done
+
+    timeout=30
+    while [ "$timeout" -gt 0 ]; do
+      get_redis_role
+      if [ "$is_master" -eq 0 ]; then
+        echo "[INFO] Failover successful"
+        exit 0
+      fi
+      sleep 1
+    done
+    echo "[ERROR] Failover timeout exceeded"
+    exit 1
 {{- end }}
 
 {{- define "fix-split-brain.sh" }}
